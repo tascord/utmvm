@@ -1,10 +1,11 @@
 [package]
 name = "utmvm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Rust library for creating and managing UTM VMs on macOS via utmctl and osascript"
 keywords = ["utm", "macos", "virtualization", "qemu", "vm"]
 license = "MIT"
+repository = "https://github.com/tascord/utmvm"
 
 [dependencies]
 thiserror = "=1.0.69"
