@@ -47,6 +47,8 @@ pub enum NetworkMode {
     Shared,
     /// Host-only — private network, no internet access.
     HostOnly,
+    /// Emulated (QEMU user networking) — supports port forwarding without admin privileges.
+    Emulated,
 }
 
 impl NetworkMode {
@@ -55,6 +57,7 @@ impl NetworkMode {
             NetworkMode::Bridged => "bridged",
             NetworkMode::Shared => "shared",
             NetworkMode::HostOnly => "host only",
+            NetworkMode::Emulated => "emulated",
         }
     }
 
@@ -63,6 +66,7 @@ impl NetworkMode {
             NetworkMode::Bridged => "Bridged",
             NetworkMode::Shared => "Shared",
             NetworkMode::HostOnly => "HostOnly",
+            NetworkMode::Emulated => "Emulated",
         }
     }
 }
@@ -83,6 +87,17 @@ impl DisplayHardware {
             DisplayHardware::Vga => "VGA",
         }
     }
+}
+
+/// A port-forward rule for emulated network mode.
+#[derive(Debug, Clone)]
+pub struct PortForward {
+    /// Protocol name used in UTM AppleScript (e.g. "TCP").
+    pub protocol: String,
+    /// Host-side port.
+    pub host_port: u16,
+    /// Guest-side port.
+    pub guest_port: u16,
 }
 
 /// Drive interface type.
@@ -109,10 +124,12 @@ impl DriveInterface {
 /// Configuration for a single drive attached to a VM.
 #[derive(Debug, Clone)]
 pub struct DriveConfig {
-    /// Size in GB. `None` for CD-ROM/ISO drives.
+    /// Size in GB. `None` for CD-ROM/ISO or image-backed drives.
     pub size_gb: Option<DiskSizeGb>,
     /// Path to an ISO image. When set this is treated as a read-only CD-ROM.
     pub iso_path: Option<PathBuf>,
+    /// Path to an existing disk image (raw or qcow2) to use as the drive source.
+    pub image_path: Option<PathBuf>,
     /// Interface type. Defaults to VirtIO for disks, USB for CD-ROMs.
     pub interface: DriveInterface,
     /// Read-only flag.
@@ -125,6 +142,7 @@ impl DriveConfig {
         Self {
             size_gb: Some(size_gb),
             iso_path: None,
+            image_path: None,
             interface: DriveInterface::VirtIO,
             read_only: false,
         }
@@ -135,8 +153,20 @@ impl DriveConfig {
         Self {
             size_gb: None,
             iso_path: Some(iso_path.into()),
+            image_path: None,
             interface: DriveInterface::Usb,
             read_only: true,
+        }
+    }
+
+    /// Create a drive backed by an existing disk image.
+    pub fn disk_image(image_path: impl Into<PathBuf>) -> Self {
+        Self {
+            size_gb: None,
+            iso_path: None,
+            image_path: Some(image_path.into()),
+            interface: DriveInterface::VirtIO,
+            read_only: false,
         }
     }
 }
@@ -146,7 +176,7 @@ impl DriveConfig {
 /// # Example
 ///
 /// ```rust
-/// use utm::{VmConfig, Architecture, NetworkMode, DriveConfig};
+/// use utmvm::{VmConfig, Architecture, NetworkMode, DriveConfig};
 ///
 /// let cfg = VmConfig::builder("my-vm")
 ///     .architecture(Architecture::Aarch64)
@@ -173,10 +203,14 @@ pub struct VmConfig {
     pub drives: Vec<DriveConfig>,
     /// Network mode.
     pub network_mode: NetworkMode,
+    /// Port-forward rules (only used in emulated network mode).
+    pub port_forwards: Vec<PortForward>,
     /// MAC address. `None` → randomly generated.
     pub mac_address: Option<MacAddress>,
     /// Display hardware.
     pub display: DisplayHardware,
+    /// Enable hypervisor (HVF on macOS). Defaults to `false`.
+    pub hypervisor: bool,
 }
 
 impl VmConfig {
@@ -202,8 +236,10 @@ impl VmConfigBuilder {
                 cpu_count: 2,
                 drives: Vec::new(),
                 network_mode: NetworkMode::Bridged,
+                port_forwards: Vec::new(),
                 mac_address: None,
                 display: DisplayHardware::VirtioGpuGlPci,
+                hypervisor: false,
             },
         }
     }
@@ -244,6 +280,12 @@ impl VmConfigBuilder {
         self
     }
 
+    /// Append a port-forward rule (emulated mode only).
+    pub fn port_forward(mut self, pf: PortForward) -> Self {
+        self.inner.port_forwards.push(pf);
+        self
+    }
+
     /// Pin a specific MAC address (otherwise randomly generated at creation time).
     pub fn mac_address(mut self, mac: MacAddress) -> Self {
         self.inner.mac_address = Some(mac);
@@ -253,6 +295,12 @@ impl VmConfigBuilder {
     /// Set display hardware.
     pub fn display(mut self, display: DisplayHardware) -> Self {
         self.inner.display = display;
+        self
+    }
+
+    /// Enable or disable hypervisor acceleration.
+    pub fn hypervisor(mut self, enabled: bool) -> Self {
+        self.inner.hypervisor = enabled;
         self
     }
 

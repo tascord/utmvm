@@ -177,6 +177,62 @@ pub async fn remove_cdrom_drive(plist_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Add a port-forward rule to network interface `index` in `config.plist`.
+///
+/// `protocol` should be `"TCP"` or `"UDP"`.
+///
+/// **Important:** UTM must be quit and restarted for this to take effect.
+pub async fn add_port_forward(
+    plist_path: &Path,
+    index: usize,
+    protocol: &str,
+    host_port: u16,
+    guest_port: u16,
+) -> Result<()> {
+    // Ensure the PortForward array exists.
+    run_ignore_err(
+        plist_path,
+        &format!("Add :Network:{index}:PortForward array"),
+    )
+    .await?;
+
+    let pf_idx = 0_usize;
+    run_ignore_err(
+        plist_path,
+        &format!("Add :Network:{index}:PortForward:{pf_idx} dict"),
+    )
+    .await?;
+
+    let protocol_cmd = format!("Set :Network:{index}:PortForward:{pf_idx}:Protocol {protocol}");
+    if run(plist_path, &protocol_cmd).await.is_err() {
+        run(
+            plist_path,
+            &format!("Add :Network:{index}:PortForward:{pf_idx}:Protocol string {protocol}"),
+        )
+        .await?;
+    }
+
+    let host_port_cmd = format!("Set :Network:{index}:PortForward:{pf_idx}:HostPort {host_port}");
+    if run(plist_path, &host_port_cmd).await.is_err() {
+        run(
+            plist_path,
+            &format!("Add :Network:{index}:PortForward:{pf_idx}:HostPort integer {host_port}"),
+        )
+        .await?;
+    }
+
+    let guest_port_cmd = format!("Set :Network:{index}:PortForward:{pf_idx}:GuestPort {guest_port}");
+    if run(plist_path, &guest_port_cmd).await.is_err() {
+        run(
+            plist_path,
+            &format!("Add :Network:{index}:PortForward:{pf_idx}:GuestPort integer {guest_port}"),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Validate the plist file using `plutil -lint`.
 pub async fn validate(plist_path: &Path) -> Result<()> {
     let output = tokio::process::Command::new("plutil")

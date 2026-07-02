@@ -53,7 +53,7 @@ pub mod network;
 pub use error::Error;
 pub use manager::UtmManager;
 pub use vm::{Vm, VmStatus, VmInfo};
-pub use config::{VmConfig, Architecture, CpuCount, MemoryMb, DiskSizeGb, NetworkMode, DriveConfig, DriveInterface, DisplayHardware};
+pub use config::{VmConfig, Architecture, CpuCount, MemoryMb, DiskSizeGb, NetworkMode, DriveConfig, DriveInterface, DisplayHardware, PortForward};
 pub use network::MacAddress;
 
 /// Convenience `Result` alias for this crate.

@@ -1,7 +1,7 @@
 //! [`UtmManager`] — the main entry point for all UTM VM operations.
 
 use crate::{
-    applescript::{osascript, osascript_multiline, qemu_img_create, utmctl, utmctl_raw},
+    applescript::{osascript, osascript_stdin, utmctl, utmctl_raw},
     config::VmConfig,
     network::MacAddress,
     plist,
@@ -111,8 +111,8 @@ impl UtmManager {
     /// Use this wrapper for any sequence of `config.plist` edits.
     ///
     /// ```rust,no_run
-    /// # use utm::UtmManager;
-    /// # async fn example(mgr: &UtmManager, name: &str) -> utm::Result<()> {
+    /// # use utmvm::UtmManager;
+    /// # async fn example(mgr: &UtmManager, name: &str) -> utmvm::Result<()> {
     /// mgr.with_utm_restart(|mgr| {
     ///     Box::pin(async move {
     ///         // plist edits here …
@@ -211,46 +211,47 @@ impl UtmManager {
     /// is unreliable for boot order.  UTM must be running when this is called.
     ///
     /// After creation the VM is **not** started automatically.
-    pub async fn create(&self, config: &VmConfig) -> Result<Vm> {
+
+    /// Create a new VM using UTM's AppleScript API.
+    ///
+    /// This is the recommended approach for programmatic VM creation; plist-only creation
+    /// is unreliable for boot order.  UTM must be running when this is called.
+    ///
+    /// After creation the VM is **not** started automatically.
+    pub async fn create(&self, config: &VmConfig) -> Result<()> {
         if self.exists(&config.name).await? {
             return Err(Error::VmAlreadyExists(config.name.clone()));
         }
 
-        // Resolve MAC address
-        let mac = config
-            .mac_address
-            .clone()
-            .unwrap_or_else(MacAddress::random_qemu);
+        // AppleScript creation with non-empty `port forwards:` in emulated mode
+        // triggers a -1700 coercion error, so we create the VM without port
+        // forwards and add them via plist in a UTM restart afterwards.
+        let mut script_config = config.clone();
+        script_config.port_forwards.clear();
+        let script = build_create_script(&script_config);
+        osascript_stdin(&script).await?;
 
-        // Build the drives AppleScript fragment
-        let drives_as = build_drives_applescript(&config.drives);
+        // Add port-forwards through plist if they were requested.
+        if !config.port_forwards.is_empty() {
+            let config_path = self.config_path(&config.name);
+            let pf = config.port_forwards[0].clone();
+            self.with_utm_restart(|_| {
+                let path = config_path.clone();
+                Box::pin(async move {
+                    plist::add_port_forward(
+                        &path,
+                        0,
+                        &pf.protocol,
+                        pf.host_port,
+                        pf.guest_port,
+                    )
+                    .await
+                })
+            })
+            .await?;
+        }
 
-        let notes_line = match &config.notes {
-            Some(n) => format!("notes:\"{n}\", "),
-            None => String::new(),
-        };
-
-        // Full AppleScript program for VM creation
-        let script = format!(
-            r#"tell application "UTM"
-    set newVM to make new virtual machine with properties {{backend:qemu, configuration:{{name:"{name}", {notes}architecture:"{arch}", memory:{mem}, cpu cores:{cpu}, drives:{{{drives}}}, network interfaces:{{{{mode:{net_mode}, hardware:"virtio-net-pci", mac address:"{mac}"}}}}, displays:{{{{hardware:"{display}"}}}}}}}}
-    return name of newVM
-end tell"#,
-            name = config.name,
-            notes = notes_line,
-            arch = config.architecture.as_str(),
-            mem = config.memory_mb,
-            cpu = config.cpu_count,
-            drives = drives_as,
-            net_mode = config.network_mode.as_applescript_str(),
-            mac = mac,
-            display = config.display.as_str(),
-        );
-
-        osascript(&script).await?;
-
-        // Retrieve the newly created VM
-        self.get(&config.name).await
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -434,6 +435,73 @@ impl Default for UtmManager {
     }
 }
 
+/// Build the AppleScript source that `create` sends to `osascript`.
+///
+/// This is exposed as a pure function so unit tests can assert the exact
+/// generated text against known-working templates.
+pub(crate) fn build_create_script(config: &VmConfig) -> String {
+    let _mac = config
+        .mac_address
+        .clone()
+        .unwrap_or_else(MacAddress::random_qemu);
+
+    let (drive_vars, drives_expr) = build_drives_applescript(&config.drives);
+
+    let notes_line = match &config.notes {
+        Some(n) => format!("notes:\"{n}\", "),
+        None => String::new(),
+    };
+    let hypervisor_line = if config.hypervisor { "hypervisor:true, " } else { "" };
+
+    let mut script = String::new();
+    script.push_str("tell application \"UTM\"\n");
+    if !drive_vars.is_empty() {
+        script.push_str(&drive_vars);
+    }
+
+    script.push_str("    make new virtual machine with properties {backend:qemu, configuration:{");
+    script.push_str(&format!("name:\"{name}\", ", name = config.name));
+    script.push_str(&notes_line);
+    script.push_str(&format!("architecture:\"{}\", ", config.architecture.as_str()));
+    script.push_str(&format!("memory:{}, ", config.memory_mb));
+    script.push_str(&format!("cpu cores:{}, ", config.cpu_count));
+    script.push_str(hypervisor_line);
+
+    // drives: opens ONE brace for the list. Each drive record already wraps
+    // itself in {…}, so we must NOT add an extra pair here.
+    script.push_str("drives:{");
+    script.push_str(&drives_expr);
+    script.push_str("}, ");
+
+    script.push_str("network interfaces:{{");
+    if matches!(config.network_mode, crate::config::NetworkMode::Emulated)
+        && !config.port_forwards.is_empty()
+    {
+        let pf = &config.port_forwards[0];
+        script.push_str("mode:");
+        script.push_str(config.network_mode.as_applescript_str());
+        script.push_str(", port forwards:{{protocol:");
+        script.push_str(&pf.protocol);
+        script.push_str(", host port:");
+        script.push_str(&pf.host_port.to_string());
+        script.push_str(", guest port:");
+        script.push_str(&pf.guest_port.to_string());
+        // Close port-forward record, port-forwards list, interface record, interfaces list.
+        script.push_str("}}}}");
+    } else {
+        script.push_str("mode:");
+        script.push_str(config.network_mode.as_applescript_str());
+        // Close interface record and interfaces list.
+        script.push_str("}}");
+    }
+
+    // Close configuration record and properties record.
+    script.push_str("}}\n");
+    script.push_str("end tell\n");
+
+    script
+}
+
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
@@ -474,20 +542,33 @@ fn parse_list_output(raw: &str) -> Vec<VmInfo> {
 }
 
 /// Build the AppleScript drives fragment for a list of drive configs.
-fn build_drives_applescript(drives: &[crate::config::DriveConfig]) -> String {
-    drives
-        .iter()
-        .map(|d| {
-            if let Some(iso) = &d.iso_path {
-                let path = iso.display();
-                format!("{{removable:true, source:POSIX file \"{path}\"}}")
-            } else {
-                let size_mb = d.size_gb.unwrap_or(20) as u64 * 1024;
-                format!("{{guest size:{size_mb}}}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+///
+/// Returns a tuple:
+/// - `String` – variable declarations (e.g. `set drive1 to POSIX file "…"\n`)
+/// - `String` – the drives expression for the `make` command record.
+fn build_drives_applescript(drives: &[crate::config::DriveConfig]) -> (String, String) {
+    let mut vars = String::new();
+    let mut exprs = Vec::new();
+
+    for (i, d) in drives.iter().enumerate() {
+        let var = format!("drive{}", i + 1);
+        if let Some(iso) = &d.iso_path {
+            vars.push_str(&format!("    set {var} to POSIX file \"{path}\"\n",
+                path = iso.display().to_string().replace('"', "\\\"")
+            ));
+            exprs.push(format!("{{removable:true, source:{var}}}"));
+        } else if let Some(img) = &d.image_path {
+            vars.push_str(&format!("    set {var} to POSIX file \"{path}\"\n",
+                path = img.display().to_string().replace('"', "\\\"")
+            ));
+            exprs.push(format!("{{source:{var}}}"));
+        } else {
+            let size_mb = d.size_gb.unwrap_or(20) as u64 * 1024;
+            exprs.push(format!("{{guest size:{size_mb}}}"));
+        }
+    }
+
+    (vars, exprs.join(", "))
 }
 
 #[cfg(test)]
@@ -517,16 +598,125 @@ mod tests {
     fn test_build_drives_applescript_cdrom() {
         use crate::config::DriveConfig;
         let drives = vec![DriveConfig::cdrom("/path/to/installer.iso")];
-        let s = build_drives_applescript(&drives);
-        assert!(s.contains("removable:true"));
-        assert!(s.contains("/path/to/installer.iso"));
+        let (vars, expr) = build_drives_applescript(&drives);
+        assert!(expr.contains("removable:true"));
+        assert!(expr.contains("source:drive1"));
+        assert!(vars.contains("set drive1 to POSIX file \"/path/to/installer.iso\""));
     }
 
     #[test]
     fn test_build_drives_applescript_disk() {
         use crate::config::DriveConfig;
         let drives = vec![DriveConfig::disk(20)];
-        let s = build_drives_applescript(&drives);
-        assert!(s.contains("guest size:20480"));
+        let (vars, expr) = build_drives_applescript(&drives);
+        assert!(vars.is_empty());
+        assert!(expr.contains("guest size:20480"));
+    }
+
+    #[test]
+    fn test_build_drives_applescript_disk_image() {
+        use crate::config::DriveConfig;
+        let drives = vec![DriveConfig::disk_image("/path/to/disk.img")];
+        let (vars, expr) = build_drives_applescript(&drives);
+        assert!(expr.contains("source:drive1"));
+        assert!(vars.contains("set drive1 to POSIX file \"/path/to/disk.img\""));
+        assert!(!expr.contains("removable"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression test: the exact AppleScript that icbm sends to UTM must
+    // match the format that was proven working before the utmvm migration.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_script_icbm_regression() {
+        use crate::config::{Architecture, DriveConfig, NetworkMode, PortForward, VmConfig};
+
+        let config = VmConfig::builder("icbm-ubuntu")
+            .architecture(Architecture::Aarch64)
+            .memory_mb(4096)
+            .cpu_count(2)
+            .hypervisor(true)
+            .drive(DriveConfig::disk_image("/tmp/noble.img"))
+            .drive(DriveConfig::cdrom("/tmp/seed.iso"))
+            .network_mode(NetworkMode::Emulated)
+            .port_forward(PortForward {
+                protocol: "TCP".to_string(),
+                host_port: 2222,
+                guest_port: 22,
+            })
+            .build();
+
+        let mut script_config = config.clone();
+        script_config.port_forwards.clear();
+        let script = build_create_script(&script_config);
+
+        // `create` clears port-forwards before calling build_create_script to
+        // avoid a -1700 AppleScript coercion error; verify the script has no
+        // port-forwards record in it.
+        let expected = concat!(
+            "tell application \"UTM\"\n",
+            "    set drive1 to POSIX file \"/tmp/noble.img\"\n",
+            "    set drive2 to POSIX file \"/tmp/seed.iso\"\n",
+            "    make new virtual machine with properties {backend:qemu, configuration:{",
+            "name:\"icbm-ubuntu\", ",
+            "architecture:\"aarch64\", ",
+            "memory:4096, ",
+            "cpu cores:2, ",
+            "hypervisor:true, ",
+            "drives:{{source:drive1}, {removable:true, source:drive2}}, ",
+            "network interfaces:{{mode:emulated}}}}\n",
+            "end tell\n",
+        );
+
+        assert_eq!(
+            script, expected,
+            "Generated AppleScript does not match the known-working template.\n\n",
+        );
+    }
+
+    #[test]
+    fn test_create_script_balanced_braces() {
+        use crate::config::{Architecture, DriveConfig, NetworkMode, PortForward, VmConfig};
+
+        // Emulated branch (icbm path)
+        let cfg1 = VmConfig::builder("test-vm")
+            .architecture(Architecture::Aarch64)
+            .memory_mb(2048)
+            .cpu_count(2)
+            .drive(DriveConfig::disk_image("/tmp/disk.img"))
+            .drive(DriveConfig::cdrom("/tmp/seed.iso"))
+            .network_mode(NetworkMode::Emulated)
+            .port_forward(PortForward {
+                protocol: "TCP".to_string(),
+                host_port: 2222,
+                guest_port: 22,
+            })
+            .build();
+
+        let s1 = build_create_script(&cfg1);
+        let opens1 = s1.chars().filter(|&c| c == '{').count();
+        let closes1 = s1.chars().filter(|&c| c == '}').count();
+        assert_eq!(
+            opens1, closes1,
+            "Emulated-branch AppleScript has unbalanced braces:\n{s1}"
+        );
+
+        // Bridged branch
+        let cfg2 = VmConfig::builder("test-vm2")
+            .architecture(Architecture::X86_64)
+            .memory_mb(4096)
+            .cpu_count(4)
+            .drive(DriveConfig::disk(40))
+            .network_mode(NetworkMode::Bridged)
+            .build();
+
+        let s2 = build_create_script(&cfg2);
+        let opens2 = s2.chars().filter(|&c| c == '{').count();
+        let closes2 = s2.chars().filter(|&c| c == '}').count();
+        assert_eq!(
+            opens2, closes2,
+            "Bridged-branch AppleScript has unbalanced braces:\n{s2}"
+        );
     }
 }

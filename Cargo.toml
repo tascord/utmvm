@@ -11,7 +11,7 @@ repository = "https://github.com/tascord/utmvm"
 thiserror = "=1.0.69"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.140"
-tokio = { version = "=1.43.0", features = ["process", "time", "macros", "rt"] }
+tokio = { version = "=1.43.0", features = ["process", "time", "macros", "rt", "io-util"] }
 uuid = { version = "=1.11.0", features = ["v4"] }
 rand = "=0.8.5"
 
