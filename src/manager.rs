@@ -10,9 +10,10 @@ use crate::{
 };
 use std::{
     net::IpAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Duration,
 };
+use tokio::fs;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -87,7 +88,9 @@ impl UtmManager {
     /// Required before any `config.plist` modifications take effect.
     pub async fn quit_utm(&self) -> Result<()> {
         osascript("quit app \"UTM\"").await?;
-        sleep(Duration::from_secs(3)).await;
+        // UTM needs generous time to flush in-memory state (VM plists,
+        // drive caches) before we start editing files externally.
+        sleep(Duration::from_secs(8)).await;
         Ok(())
     }
 
@@ -102,7 +105,9 @@ impl UtmManager {
             let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(Error::Other(format!("failed to launch UTM: {msg}")));
         }
-        sleep(Duration::from_secs(5)).await;
+        // Delay is critical — UTM must finish loading all VM bundles and
+        // setting up QEMU configurations before we issue further commands.
+        sleep(Duration::from_secs(8)).await;
         Ok(())
     }
 
@@ -205,6 +210,62 @@ impl UtmManager {
     // VM creation
     // -----------------------------------------------------------------------
 
+    /// After AppleScript creates a VM, CD-ROM drives lack `ImageName` in the
+    /// plist.  Copy the ISO into the VM bundle's `Data/` directory and set the
+    /// `ImageName` key so UTM can find the media on restart.
+    async fn fixup_cdrom_images(&self, config: &VmConfig) -> Result<()> {
+        let bundle = self.bundle_path(&config.name);
+        if !bundle.exists() {
+            return Err(Error::ConfigNotFound(
+                config.name.clone(),
+                bundle.display().to_string(),
+            ));
+        }
+
+        let data_dir = bundle.join("Data");
+        tokio::fs::create_dir_all(&data_dir).await.map_err(Error::Io)?;
+        let plist = self.config_path(&config.name);
+
+        for drive in &config.drives {
+            let Some(iso) = &drive.iso_path else { continue };
+            let Some(filename) = iso.file_name() else {
+                return Err(Error::Other(format!(
+                    "invalid ISO path for VM '{}': {}",
+                    config.name,
+                    iso.display()
+                )));
+            };
+
+            // Copy ISO into the bundle so the sandboxed UTM can always find it.
+            let dest = data_dir.join(filename);
+            fs::copy(iso, &dest).await.map_err(Error::Io)?;
+
+            // Find the drive entry and set ImageName.
+            for i in 0..16 {
+                let key = format!(":Drive:{i}:ImageType");
+                match plist::get_string(&plist, &key).await {
+                    Ok(v) if v.trim() == "CD" => {
+                        let img_name = filename.to_string_lossy();
+                        let set_cmd = format!(
+                            "Set :Drive:{i}:ImageName {img_name}"
+                        );
+                        let _ = plist::run(&plist, &set_cmd).await;
+                        // If Set fails (key doesn't exist), try Add.
+                        let add_cmd = format!(
+                            "Add :Drive:{i}:ImageName string {img_name}"
+                        );
+                        let _ = plist::run(&plist, &add_cmd).await;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create a new VM using UTM's AppleScript API.
     ///
     /// This is the recommended approach for programmatic VM creation; plist-only creation
@@ -230,6 +291,15 @@ impl UtmManager {
         script_config.port_forwards.clear();
         let script = build_create_script(&script_config);
         osascript_stdin(&script).await?;
+
+        // Give UTM time to finish writing the new VM's plist before we
+        // start editing files externally.
+        sleep(Duration::from_secs(5)).await;
+
+        // AppleScript one-shot creation does not set ImageName for CD-ROM
+        // drives.  Copy the ISO into the bundle and patch the plist so UTM
+        // can find the media.
+        self.fixup_cdrom_images(config).await?;
 
         // Add port-forwards through plist if they were requested.
         if !config.port_forwards.is_empty() {
