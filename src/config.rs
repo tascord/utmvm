@@ -211,6 +211,8 @@ pub struct VmConfig {
     pub display: DisplayHardware,
     /// Enable hypervisor (HVF on macOS). Defaults to `false`.
     pub hypervisor: bool,
+    /// Extra QEMU command-line arguments appended to the VM launch.
+    pub qemu_additional_args: Vec<String>,
 }
 
 impl VmConfig {
@@ -240,6 +242,7 @@ impl VmConfigBuilder {
                 mac_address: None,
                 display: DisplayHardware::VirtioGpuGlPci,
                 hypervisor: false,
+                qemu_additional_args: Vec::new(),
             },
         }
     }
@@ -301,6 +304,12 @@ impl VmConfigBuilder {
     /// Enable or disable hypervisor acceleration.
     pub fn hypervisor(mut self, enabled: bool) -> Self {
         self.inner.hypervisor = enabled;
+        self
+    }
+
+    /// Add an extra QEMU command-line argument.
+    pub fn qemu_arg(mut self, arg: impl Into<String>) -> Self {
+        self.inner.qemu_additional_args.push(arg.into());
         self
     }
 

@@ -233,6 +233,37 @@ pub async fn add_port_forward(
     Ok(())
 }
 
+/// Append extra QEMU command-line arguments to `config.plist`.
+///
+/// **Important:** UTM must be quit and restarted for this to take effect.
+pub async fn add_qemu_additional_args(plist_path: &Path, args: &[&str]) -> Result<()> {
+    // Ensure the array exists.
+    run_ignore_err(plist_path, "Add :QEMU:AdditionalArguments array").await?;
+
+    for arg in args {
+        // PlistBuddy doesn't have an "append" operation.  Find the next free
+        // index by probing until we get an error (index out of range).
+        let mut idx = 0;
+        loop {
+            let test_cmd = format!("Print :QEMU:AdditionalArguments:{idx}");
+            if run(plist_path, &test_cmd).await.is_err() {
+                // idx is free — add the argument here.
+                run(
+                    plist_path,
+                    &format!(
+                        "Add :QEMU:AdditionalArguments:{idx} string {arg}"
+                    ),
+                )
+                .await?;
+                break;
+            }
+            idx += 1;
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate the plist file using `plutil -lint`.
 pub async fn validate(plist_path: &Path) -> Result<()> {
     let output = tokio::process::Command::new("plutil")
